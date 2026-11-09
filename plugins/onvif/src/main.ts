@@ -284,6 +284,25 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             )
         }
 
+        ret.push(
+            {
+                subgroup: 'Advanced',
+                title: 'Two Way Audio Codec',
+                description: 'Default sends G.711 µ-law when the camera offers it. Some cameras (e.g. EZVIZ/Hikvision firmware) only play two way audio in the codec they stream, and silently drop the rest.',
+                key: 'onvifTwoWayCodec',
+                value: this.storage.getItem('onvifTwoWayCodec') || 'Default',
+                choices: ['Default', 'Match Camera Audio'],
+            },
+            {
+                subgroup: 'Advanced',
+                title: 'Two Way Audio Transport',
+                description: 'UDP falls back to TCP when the camera rejects it. Some cameras accept UDP two way audio but never play it.',
+                key: 'onvifTwoWayTransport',
+                value: this.storage.getItem('onvifTwoWayTransport') || 'UDP',
+                choices: ['UDP', 'TCP'],
+            },
+        );
+
         const ac = {
             ...automaticallyConfigureSettings,
             subgroup: 'Advanced',

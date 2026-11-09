@@ -38,8 +38,10 @@ export class OnvifIntercom implements Intercom {
         const audioBackchannel = parsedSdp.msections.find(msection => msection.type === 'audio' && msection.direction === 'sendonly');
         if (!audioBackchannel)
             throw new Error('ONVIF audio backchannel not found');
+        // the audio track the camera itself streams.
+        const cameraAudio = parsedSdp.msections.find(msection => msection.type === 'audio' && msection.direction !== 'sendonly');
 
-        return { audioBackchannel, intercomClient };
+        return { audioBackchannel, intercomClient, cameraAudio };
     }
 
     async startIntercom(media: MediaObject) {
@@ -47,7 +49,7 @@ export class OnvifIntercom implements Intercom {
 
         await this.stopIntercom();
 
-        const { audioBackchannel, intercomClient } = await this.checkIntercom();
+        const { audioBackchannel, intercomClient, cameraAudio } = await this.checkIntercom();
         if (!audioBackchannel)
             throw new Error('ONVIF audio backchannel not found');
 
@@ -59,7 +61,8 @@ export class OnvifIntercom implements Intercom {
         let serverRtp: number;
         let transportDict: ReturnType<typeof parseSemicolonDelimited>;
         let tcp = false;
-        try {
+
+        const setupUdp = async () => {
             const headers: any = {
                 Require,
                 Transport: `RTP/AVP;unicast;client_port=${rtp}-${rtcp}`,
@@ -73,11 +76,10 @@ export class OnvifIntercom implements Intercom {
             const { server_port } = transportDict;
             const serverPorts = server_port.split('-');
             serverRtp = parseInt(serverPorts[0]);
-        }
-        catch (e) {
-            tcp = true;
-            this.camera.console.error('onvif udp backchannel failed, falling back to tcp', e);
+            tcp = false;
+        };
 
+        const setupTcp = async () => {
             const headers: any = {
                 Require,
                 Transport: `RTP/AVP/TCP;unicast;interleaved=0-1`,
@@ -93,11 +95,40 @@ export class OnvifIntercom implements Intercom {
             server.server.on('message', data => {
                 intercomClient.send(data, 0);
             });
+            tcp = true;
+        };
+
+        // some cameras (EZVIZ/Hikvision firmware) accept a UDP backchannel SETUP but silently
+        // drop the audio, while the same audio over TCP interleaved plays.
+        if (this.camera.storage.getItem('onvifTwoWayTransport') === 'TCP') {
+            try {
+                await setupTcp();
+            }
+            catch (e) {
+                this.camera.console.error('onvif tcp backchannel failed, falling back to udp', e);
+                await setupUdp();
+            }
+        }
+        else {
+            try {
+                await setupUdp();
+            }
+            catch (e) {
+                this.camera.console.error('onvif udp backchannel failed, falling back to tcp', e);
+                await setupTcp();
+            }
         }
         this.camera.console.log('backchannel transport', transportDict);
 
         const availableMatches = audioBackchannel.rtpmaps.filter(rtpmap => rtpmap.ffmpegEncoder);
-        const defaultMatch = audioBackchannel.rtpmaps.find(rtpmap => rtpmap.ffmpegEncoder === 'pcm_mulaw') || audioBackchannel.rtpmaps.find(rtpmap => rtpmap.ffmpegEncoder);
+        // some cameras (EZVIZ/Hikvision firmware) only play backchannel audio in the codec
+        // they are configured to stream, and silently drop everything else.
+        const matchCameraAudio = this.camera.storage.getItem('onvifTwoWayCodec') === 'Match Camera Audio';
+        const cameraMatch = matchCameraAudio && cameraAudio?.codec
+            ? availableMatches.find(rtpmap => rtpmap.codec === cameraAudio.codec && (!cameraAudio.rtpmap?.clock || rtpmap.clock === cameraAudio.rtpmap.clock))
+            : undefined;
+        const defaultMatch = cameraMatch || audioBackchannel.rtpmaps.find(rtpmap => rtpmap.ffmpegEncoder === 'pcm_mulaw') || audioBackchannel.rtpmaps.find(rtpmap => rtpmap.ffmpegEncoder);
+        this.camera.console.log('backchannel codec', defaultMatch?.codec, defaultMatch?.clock, 'tcp', tcp);
 
         if (!defaultMatch)
             throw new Error('no supported codec was found for back channel');
@@ -135,7 +166,7 @@ export class OnvifIntercom implements Intercom {
                             return false;
                         if (check.clock !== rtpmap.clock)
                             return false;
-                        payloadType = check.payloadType;
+                        payloadType = rtpmap.payloadType ?? check.payloadType;
                         // this default check should maybe be in sdp-utils.ts.
                         if (payloadType === undefined)
                             payloadType = 8;
@@ -178,8 +209,11 @@ export class OnvifIntercom implements Intercom {
                 encoderArguments: [
                     '-acodec', defaultMatch.ffmpegEncoder,
                     '-ar', defaultMatch.clock.toString(),
-                    "-b:a", "64k",
+                    "-b:a", defaultMatch.codec === 'aac' ? "32k" : "64k",
                     '-ac', defaultMatch.channels?.toString() || '1',
+                    // one AAC frame per RTP packet. by default ffmpeg aggregates several,
+                    // which some cameras accept but never play.
+                    ...(defaultMatch.codec === 'aac' ? ['-max_delay', '0'] : []),
                 ],
             }
         });
